@@ -62,14 +62,19 @@ _DEFAULT_CONFIG = {
     # Model compilation is broken on some torch.compile + Blackwell combinations and
     # only matters for repeated calls inside a single process. Disable for stability.
     "enable_model_compilation": False,
-    # Default-resolution head from OTAS's repo config (matches OTAS_small.json for size
-    # but lifts shared_feat_resolution to 32 for better per-pixel detail before the
-    # bilinear upsample to original resolution).
-    "dinov2_input_size": 518,
+    # OTAS paper Table V / supplementary §VII.A configuration. These four knobs match
+    # the published RELLIS-3D backbone-ablation protocol verbatim:
+    #   - dinov2_input_size=224 yields DINOv2's native 16×16 patch grid (14-px patches),
+    #     which is then bilinear-interpolated up to the d=64 shared resolution.
+    #   - shared_feat_resolution=64 = the d=64 shared feature grid used by the paper.
+    #   - n_clusters=24, n_components=24 = k=24, Cr=24 from the paper.
+    # These apply to every dataset on the scoreboard, not just RELLIS, so the OTAS
+    # column reports numbers under a single internally consistent config.
+    "dinov2_input_size": 224,
     "dino_scale_factor": 2,
-    "shared_feat_resolution": 32,
+    "shared_feat_resolution": 64,
     "n_clusters": 24,
-    "n_components": 12,
+    "n_components": 24,
     "enable_amp_autocast": True,
 }
 
