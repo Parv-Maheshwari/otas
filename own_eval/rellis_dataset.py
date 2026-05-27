@@ -1,9 +1,10 @@
 # RELLIS-3D Dataset (Texas A&M off-road autonomous-driving benchmark) loader for OTAS.
 #
-# Yields `(image_f (4,H,W), label (H,W), name_safe (str), th_vis (3,H,W))` tuples — the
-# same shape the OTAS `own_eval/eval_common.run_eval` loop expects. Self-contained so the
-# RELLIS-3D replication can be reproduced from a single OTAS checkout, no sibling repos
-# required.
+# Yields `(image_f (4,H,W), label (H,W), name_safe (str))` tuples — the same shape the
+# OTAS `own_eval/eval_common.run_eval` loop expects. Self-contained so the RELLIS-3D
+# replication can be reproduced from a single OTAS checkout, no sibling repos required.
+# Mirrors `/home/ubuntu/code/OpenRSS/util/RELLIS_dataset.py` one-for-one — keep them in
+# sync if you change one.
 #
 # RELLIS-3D ships:
 #   - RGB:  pylon_camera_node/<seq>/<stem>.jpg            (1920x1200)
@@ -24,8 +25,17 @@
 # `RemapRellisUnknownLabel` does in RADSeg/evaluation/2d/custom_datasets.py — same
 # mapping, same class order.
 #
-# Returned tuple matches GOD_dataset's contract so eval_common.run_eval works unchanged:
-#   (image_f (4,H,W) float[0,1] R G B 0, label (H,W) int64 in 0..19, name_safe (str), th_vis (3,H,W) float)
+# Modality contract: RELLIS has only one valid eval mode (RGB). There is no `mask_modality`
+# argument and no thermal channel — earlier revisions accepted a `mask_modality` flag for
+# "API parity with GOD_dataset", but the four-way enum (`none`/`rgb_only`/`thermal_only`)
+# was a semantic lie on RELLIS: `none` = "RGB + zero-padded T" (not RGB+T fusion); `rgb_only`
+# was a no-op (the T was already zero); `thermal_only` silently produced an all-zero input
+# and ran garbage IoU. No caller exercised any mode other than `none`, so the parameter has
+# been removed.
+#
+# Returned tuple: `(image_f (4,H,W) float[0,1] R G B 0, label (H,W) int64 in 0..19,
+# name_safe (str))`. The 4th channel is constant zero (no thermal sensor) — kept on the
+# tensor only so the same SAM 4-channel input convention works.
 
 import os
 import numpy as np
@@ -33,7 +43,6 @@ import torch
 from torch.utils.data.dataset import Dataset
 import PIL
 from PIL import Image
-from matplotlib import cm
 
 
 # Order matches Rellis-3D/ontology.yaml + RADSeg's RELLIS_UNKNOWN_CLASSES. Singular `tree`
@@ -66,79 +75,20 @@ def _build_remap_lut() -> np.ndarray:
 _REMAP_LUT = _build_remap_lut()
 
 
-# --- HRNet 19-class learning ontology (the canonical 2D RELLIS benchmark setup) ---------
-#
-# Source: benchmarks/HRNet-Semantic-Segmentation-HRNet-OCR/lib/datasets/rellis.py:label_mapping.
-# Raw void + dirt collapse to a single contig 0 "unknown" — siglip2/MaskCLIP can't ground
-# bare "void"/"dirt" reliably so the HRNet-trained baseline lumps them, and we follow suit
-# for OVSS replication. Raw 32 (out-of-ontology) -> water, raw 29/30 -> grass per the
-# HRNet remap; these are dataset-internal special cases that don't appear in the official
-# 20-name ontology but are non-zero in the released label PNGs (rare). 19 contig classes
-# total (1..18 fg + 0 unknown), the same shape published RELLIS-3D 2D HRNet/GSCNN results
-# table is reported on.
-#
-# Class string ordering follows the remapped-ID order so contig 1 = grass, contig 2 = tree,
-# … contig 18 = rubble. Same wording as the 20-class variant (singular `tree`).
-RELLIS_HRNET_CLASS_NAMES = [
-    "unknown",     # 0 — raw 0 (void) ∪ raw 1 (dirt). bare-name grounded as best-effort.
-    "grass",       # 1 — raw 3, 29, 30
-    "tree",        # 2 — raw 4
-    "pole",        # 3 — raw 5
-    "water",       # 4 — raw 6, 32
-    "sky",         # 5 — raw 7
-    "vehicle",     # 6 — raw 8
-    "object",      # 7 — raw 9
-    "asphalt",     # 8 — raw 10
-    "building",    # 9 — raw 12
-    "log",         # 10 — raw 15
-    "person",      # 11 — raw 17
-    "fence",       # 12 — raw 18
-    "bush",        # 13 — raw 19
-    "concrete",    # 14 — raw 23
-    "barrier",     # 15 — raw 27
-    "puddle",      # 16 — raw 31
-    "mud",         # 17 — raw 33
-    "rubble",      # 18 — raw 34
-]
-RELLIS_HRNET_NUM_CLASSES = len(RELLIS_HRNET_CLASS_NAMES)  # 19
-
-# Verbatim from benchmarks/HRNet-Semantic-Segmentation-HRNet-OCR/lib/datasets/rellis.py.
-RELLIS_HRNET_RAW_TO_CONTIGUOUS = {
-    0: 0, 1: 0, 3: 1, 4: 2, 5: 3, 6: 4, 7: 5, 8: 6, 9: 7, 10: 8,
-    12: 9, 15: 10, 17: 11, 18: 12, 19: 13, 23: 14, 27: 15,
-    29: 1, 30: 1,  # special-case raw ids the HRNet loader treats as grass
-    31: 16, 32: 4,  # raw 32 -> water per HRNet
-    33: 17, 34: 18,
-}
-
-
-def _build_hrnet_remap_lut() -> np.ndarray:
-    # Default 0 (unknown) so any raw id not explicitly listed lands at 0 — including the
-    # ontology-gap ids and any future sensor-noise values. Matches HRNet's behaviour where
-    # the default-init mapping is to ignore.
-    lut = np.zeros(256, dtype=np.uint8)
-    for raw, mapped in RELLIS_HRNET_RAW_TO_CONTIGUOUS.items():
-        lut[raw] = mapped
-    return lut
-
-
-_HRNET_REMAP_LUT = _build_hrnet_remap_lut()
-
-
 class RELLIS_dataset(Dataset):
-    # Yields (image_tensor (4,H,W) float[0,1], label_tensor (H,W) int64, name_safe (str),
-    # th_vis (3,H,W) float[0,1]) so OTAS's eval_common.run_eval can consume it unchanged.
+    # Yields (image_tensor (4,H,W) float[0,1] with channel 3 = constant zero, label_tensor
+    # (H,W) int64, name_safe (str)) so OTAS's eval_common.run_eval can consume it unchanged.
     #
     # `data_dir` should point at the extracted Rellis-3D root (the directory containing the
     # split lists and the 5 sequence subdirs 00000..00004). The split list is read directly
     # from `<data_dir>/<split>.lst` — no separate `split_dir` is needed; RELLIS ships them
     # at the dataset root.
-    #
-    # `mask_modality` is accepted for API parity with GOD_dataset (so any test loop that
-    # branches on it still works) but only "none" makes sense here — RELLIS has no thermal,
-    # so zeroing R/G/B vs the always-zero thermal channel is meaningless.
-    def __init__(self, data_dir, split="test", split_dir=None, input_h=480, input_w=640,
-                 transform=None, cm_type="jet", mask_modality="none", ontology="raw20"):
+    def __init__(self, data_dir, split="test", split_dir=None, input_h=None, input_w=None,
+                 transform=None):
+        # input_h/input_w default to None — when unset the Basler pylon JPGs
+        # and matching label PNGs (both 1920×1200 natively) are returned at
+        # their native shape with no resize. Pass explicit (input_h, input_w)
+        # to score on a custom grid.
         super().__init__()
         self.data_dir = data_dir
         # split_dir is accepted for API parity with GOD_dataset but ignored — RELLIS ships
@@ -148,26 +98,8 @@ class RELLIS_dataset(Dataset):
         self.input_h = input_h
         self.input_w = input_w
         self.transform = transform or []
-        self.cm_type = cm_type
-        if mask_modality not in {"none", "rgb_only", "thermal_only"}:
-            raise ValueError(
-                f"mask_modality must be one of none|rgb_only|thermal_only, got {mask_modality!r}")
-        self.mask_modality = mask_modality
-        # ontology controls which LUT + class list the loader uses:
-        #   "raw20"  — 20 classes (1 unknown + 19 fg), unknown-incl raw RELLIS ontology
-        #              (parallel to RADSeg's RellisUnknownInclDataset).
-        #   "hrnet19" — 19 classes (1 unknown + 18 fg) under HRNet's `label_mapping`. Used
-        #              for replicating the canonical 2D RELLIS benchmark numbers (likely
-        #              what the OTAS paper Table V reports on).
-        if ontology not in {"raw20", "hrnet19"}:
-            raise ValueError(f"ontology must be raw20|hrnet19, got {ontology!r}")
-        self.ontology = ontology
-        if ontology == "raw20":
-            self._lut = _REMAP_LUT
-            self.class_names = RELLIS_CLASS_NAMES
-        else:
-            self._lut = _HRNET_REMAP_LUT
-            self.class_names = RELLIS_HRNET_CLASS_NAMES
+        self._lut = _REMAP_LUT
+        self.class_names = RELLIS_CLASS_NAMES
 
         # Parse the split file. Each line has two whitespace-separated relative paths.
         split_path = os.path.join(self.split_dir, split + ".lst")
@@ -193,60 +125,61 @@ class RELLIS_dataset(Dataset):
         stem, _ext = os.path.splitext(img_rel)
         name_safe = stem.replace("/", "_")
 
-        # RGB at 1920x1200 -> bilinear resize to (input_h, input_w)
+        # RGB at 1920x1200; resize to (input_h, input_w) if those are set, else
+        # keep native.
         rgb_path = os.path.join(self.data_dir, img_rel)
         rgb = np.asarray(PIL.Image.open(rgb_path).convert("RGB"))  # (1200, 1920, 3) uint8
-        rgb_resized = np.asarray(
-            PIL.Image.fromarray(rgb).resize((self.input_w, self.input_h),
-                                            resample=PIL.Image.BILINEAR)
-        )  # (input_h, input_w, 3) uint8
 
-        # Synthetic zero thermal channel — RELLIS-3D has no thermal sensor. The 4-channel
-        # contract is preserved so eval_common doesn't need a separate code path.
-        th_resized = np.zeros((self.input_h, self.input_w), dtype=np.uint8)
+        # Label from pylon_camera_node_label_id (same resolution as RGB).
+        # Confirmed across the released test split: every label PNG is PIL mode "L",
+        # (1200, 1920) uint8, holding raw class IDs in the documented sparse set
+        # {0, 1, 3-10, 12, 15, 17-19, 23, 27, 31, 33-34}. Colored annotations live
+        # in the sibling pylon_camera_node_label_color/ directory and are never
+        # loaded here. Remap via LUT to contig [0..19].
+        label_path = os.path.join(self.data_dir, label_rel)
+        raw_label = np.asarray(PIL.Image.open(label_path))  # (1200, 1920) uint8
+        remapped = self._lut[raw_label]
 
-        # Modality-ablation hook for API parity with GOD_dataset. On RELLIS rgb_only is the
-        # natural state; thermal_only would zero out everything and is meaningless here.
-        if self.mask_modality == "rgb_only":
-            th_resized = np.zeros_like(th_resized)
-        elif self.mask_modality == "thermal_only":
-            rgb_resized = np.zeros_like(rgb_resized)
+        # input_h/input_w None ⇒ keep native (RGB and label are both 1920×1200
+        # so this is a true no-op); else bilinear-resize RGB, NEAREST-resize
+        # label.
+        if self.input_h is None and self.input_w is None:
+            rgb_resized = rgb
+            label = remapped.astype(np.int64)
+            th_h, th_w = rgb.shape[:2]
+        else:
+            rgb_resized = np.asarray(
+                PIL.Image.fromarray(rgb).resize((self.input_w, self.input_h),
+                                                resample=PIL.Image.BILINEAR)
+            )
+            label = np.asarray(
+                PIL.Image.fromarray(remapped).resize((self.input_w, self.input_h),
+                                                     resample=PIL.Image.NEAREST),
+                dtype=np.int64,
+            )
+            th_h, th_w = self.input_h, self.input_w
+
+        # 4th channel is constant zero — RELLIS-3D has no thermal sensor. Kept on the tensor
+        # so the same SAM 4-channel input convention works; downstream modality switches in
+        # GOD-style eval loops are not relevant here.
+        th_resized = np.zeros((th_h, th_w), dtype=np.uint8)
 
         # (H, W, 4) uint8 R G B 0
         image = np.dstack([rgb_resized, th_resized])
 
-        # Label from pylon_camera_node_label_id (same resolution as RGB).
-        # Remap via LUT to contig [0..19]; nearest-neighbor downsample to (input_h, input_w).
-        label_path = os.path.join(self.data_dir, label_rel)
-        raw_label = np.asarray(PIL.Image.open(label_path))  # (1200, 1920) uint8
-        if raw_label.ndim == 3:
-            raw_label = raw_label[:, :, 0]
-        remapped = self._lut[raw_label]
-        label = np.asarray(
-            PIL.Image.fromarray(remapped).resize((self.input_w, self.input_h),
-                                                 resample=PIL.Image.NEAREST),
-            dtype=np.int64,
-        )
-
         for func in self.transform:
             image, label = func(image, label)
 
-        # th_vis: GOD uses a jet colormap on the thermal channel for the qualitative panels.
-        # Here the channel is all-zero so th_vis is a constant blue rectangle — harmless,
-        # but it keeps the 4-tuple shape that eval_common.run_eval expects.
-        cmap = cm.get_cmap(self.cm_type)
-        th_vis = (cmap(image[:, :, 3])[:, :, :3] * 255).astype(np.uint8)
-        th_vis = np.asarray(
-            PIL.Image.fromarray(th_vis).resize((self.input_w, self.input_h)),
-            dtype=np.float32,
-        ).transpose((2, 0, 1)) / 255
+        # `image` is already (input_h, input_w, 4) uint8 — RGB was resized at
+        # load time and dstack'd with the zero thermal channel. So we only need
+        # the uint8 -> float32/255 cast and the HWC -> CHW transpose that
+        # PyTorch expects. The earlier PIL round-trip-with-resize here was a
+        # copy-paste from MF_dataset (where it IS load-bearing because that
+        # adapter resizes at this final step) and ran an identity resize on
+        # every frame.
+        image_f = image.astype(np.float32).transpose(2, 0, 1) / 255
 
-        image_f = np.asarray(
-            PIL.Image.fromarray(image).resize((self.input_w, self.input_h)),
-            dtype=np.float32,
-        ).transpose((2, 0, 1)) / 255
-
-        return torch.tensor(image_f), torch.tensor(label), name_safe, th_vis
+        return torch.tensor(image_f), torch.tensor(label), name_safe
 
     def __len__(self):
         return self.n_data
