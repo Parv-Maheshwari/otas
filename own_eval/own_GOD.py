@@ -47,6 +47,7 @@ GOD_PALETTE = [
     [128, 0, 128],      # rubble
     [153, 0, 255],      # mulch
     [128, 128, 128],    # gravel
+    [240, 240, 240],    # snow
 ]
 assert len(GOD_PALETTE) == len(GOD_CLASS_NAMES), (
     f"GOD palette/class-name length mismatch: {len(GOD_PALETTE)} vs {len(GOD_CLASS_NAMES)}"
